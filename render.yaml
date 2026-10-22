@@ -6,7 +6,8 @@ services:
     runtime: node
     plan: free
     region: singapore
-    buildCommand: npm ci && npm run build
+    # --include=dev: the build needs Prisma CLI, Tailwind and TypeScript even if NODE_ENV=production is set.
+    buildCommand: npm ci --include=dev && npm run build
     startCommand: npm start
     healthCheckPath: /api/v1/health
     envVars:

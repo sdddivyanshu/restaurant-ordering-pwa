@@ -2,6 +2,34 @@
 
 Nothing in this repository has been deployed; this is the recommended production setup.
 
+## Free demo deployment: Render + Neon
+
+Suitable for demos only. The free Render service sleeps after ~15 min idle (first request then takes
+~30–60 s), and uploaded images are lost on restart (bundled menu images are unaffected).
+
+1. **Neon** (neon.tech): create a project, region close to your users; copy the **pooled** connection string.
+2. **Prepare the database from your PC** (PowerShell, in `restaurant-ordering-pwa`):
+   ```powershell
+   $env:DATABASE_URL = "<neon pooled connection string>"
+   npx prisma migrate deploy
+   # Real use: create roles + restaurant + your admin account
+   $env:ADMIN_EMAIL = "you@example.com"; $env:ADMIN_PASSWORD = "<long unique password>"; npm run bootstrap
+   # OR throwaway demo: load sample data (clears that database first)
+   # npm run db:seed
+   Remove-Item Env:DATABASE_URL
+   ```
+3. **GitHub**: create an empty repository, then from `restaurant-ordering-pwa`:
+   `git remote add origin https://github.com/<you>/<repo>.git` and `git push -u origin main`.
+4. **Render** (render.com) → New → **Blueprint** → pick the repo. `render.yaml` defines the service; when
+   prompted, paste `DATABASE_URL` (Neon) and set `APP_BASE_URL` to `https://<service-name>.onrender.com`
+   (you can fill it after the first deploy shows the URL, then redeploy). `APP_SECRET` is generated for you.
+5. For the seeded demo only: add `ALLOW_DEMO_ACCOUNTS=true` in Render so the demo staff logins work
+   (their password is public — never do this with real data).
+6. Print QR codes from **Admin → Tables & QR** on the live site (they use `APP_BASE_URL`).
+
+Customer phone verification (and therefore points redemption) stays off until an SMS provider is added
+(`OTP_MODE=disabled`).
+
 ## Target topology
 
 - **App**: the Docker image in `Dockerfile` (Node 22, `next start`, non-root) on any container platform
