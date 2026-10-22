@@ -1,0 +1,199 @@
+openapi: 3.1.0
+info:
+  title: Restaurant Ordering API
+  version: 1.0.0
+  description: |
+    Versioned REST API. All bodies are JSON. Errors use `{error:{code,message,details?}}`.
+    Auth via HttpOnly cookies `rs_staff` (staff) and `rs_cust` (customer). See docs/api.md for the full
+    endpoint list and permissions; schemas below cover the core ordering workflow.
+servers:
+  - url: /api/v1
+components:
+  securitySchemes:
+    staffCookie: { type: apiKey, in: cookie, name: rs_staff }
+    customerCookie: { type: apiKey, in: cookie, name: rs_cust }
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code: { type: string, examples: [VALIDATION_ERROR, PRICE_CHANGED, FORBIDDEN] }
+            message: { type: string }
+            details: {}
+    CartLine:
+      type: object
+      required: [menuItemId, quantity]
+      properties:
+        menuItemId: { type: string }
+        quantity: { type: integer, minimum: 1, maximum: 20 }
+        selections:
+          type: array
+          items:
+            type: object
+            required: [groupId, optionIds]
+            properties:
+              groupId: { type: string }
+              optionIds: { type: array, items: { type: string } }
+        notes: { type: string, maxLength: 200 }
+    Quote:
+      type: object
+      properties:
+        lines: { type: array, items: { type: object } }
+        issues: { type: array, items: { type: object, properties: { index: { type: integer }, code: { type: string }, message: { type: string } } } }
+        subtotalPaise: { type: integer }
+        discountPaise: { type: integer }
+        taxPaise: { type: integer }
+        roundingPaise: { type: integer }
+        totalPaise: { type: integer }
+        taxBreakdown: { type: array, items: { type: object } }
+        reward: { type: [object, "null"] }
+        rewardError: { type: [object, "null"] }
+    SupervisorAction:
+      oneOf:
+        - { type: object, required: [action, expectedVersion], properties: { action: { const: approve }, expectedVersion: { type: integer } } }
+        - { type: object, required: [action, reason], properties: { action: { const: reject }, reason: { type: string, minLength: 3 } } }
+        - { type: object, required: [action, note], properties: { action: { const: flag }, note: { type: string } } }
+        - { type: object, required: [action], properties: { action: { const: resolve-flag }, note: { type: string } } }
+        - { type: object, required: [action, expectedVersion, kind, reason, lines], properties: { action: { const: propose-change }, expectedVersion: { type: integer }, kind: { enum: [SUBSTITUTION, QUANTITY, CUSTOMIZATION, REMOVAL, MIXED] }, reason: { type: string }, lines: { type: array, items: { $ref: "#/components/schemas/CartLine" } } } }
+        - { type: object, required: [action], properties: { action: { const: withdraw-change } } }
+        - { type: object, required: [action, body], properties: { action: { const: note }, body: { type: string } } }
+        - { type: object, required: [action, reason], properties: { action: { const: cancel }, reason: { type: string } } }
+  responses:
+    Error:
+      description: Error
+      content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } }
+paths:
+  /health:
+    get:
+      summary: Liveness/readiness
+      responses: { "200": { description: OK }, "503": { description: Database unreachable } }
+  /public/qr:
+    post:
+      summary: Validate a table QR token and open/join the visit
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [token], properties: { token: { type: string } } } } } }
+      responses: { "200": { description: Table identified }, "404": { $ref: "#/components/responses/Error" }, "403": { $ref: "#/components/responses/Error" }, "410": { $ref: "#/components/responses/Error" } }
+  /public/menu:
+    get:
+      summary: Public menu
+      parameters: [{ name: lang, in: query, schema: { enum: [en, hi] } }]
+      responses: { "200": { description: Menu } }
+  /customer/session:
+    post:
+      summary: Register name + mobile for the table visit
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [qrToken, name, phone, privacyConsent]
+              properties:
+                qrToken: { type: string }
+                name: { type: string, maxLength: 60 }
+                phone: { type: string }
+                privacyConsent: { const: true }
+                marketingConsent: { type: boolean }
+                language: { enum: [en, hi] }
+      responses: { "201": { description: Session created (sets rs_cust) }, "400": { $ref: "#/components/responses/Error" } }
+  /customer/cart:
+    post:
+      security: [{ customerCookie: [] }]
+      summary: Server-side quote
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [lines], properties: { lines: { type: array, items: { $ref: "#/components/schemas/CartLine" } }, rewardId: { type: [string, "null"] } } } } } }
+      responses: { "200": { description: Quote, content: { application/json: { schema: { $ref: "#/components/schemas/Quote" } } } } }
+  /customer/orders:
+    post:
+      security: [{ customerCookie: [] }]
+      summary: Submit an order (always PENDING_APPROVAL)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [lines, expectedTotalPaise, idempotencyKey]
+              properties:
+                lines: { type: array, items: { $ref: "#/components/schemas/CartLine" } }
+                rewardId: { type: [string, "null"] }
+                specialInstructions: { type: string, maxLength: 500 }
+                expectedTotalPaise: { type: integer, description: Total the customer confirmed; must equal the server quote }
+                idempotencyKey: { type: string, minLength: 8 }
+      responses:
+        "201": { description: Created }
+        "200": { description: Duplicate submission — existing order returned }
+        "409": { description: PRICE_CHANGED or CART_INVALID (details.quote has the fresh quote) }
+        "422": { description: REWARD_INVALID }
+  /customer/orders/{id}:
+    get:
+      security: [{ customerCookie: [] }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { "200": { description: Order view }, "404": { description: Not found or not yours } }
+  /customer/orders/{id}/change-response:
+    post:
+      security: [{ customerCookie: [] }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [changeRequestId, accept], properties: { changeRequestId: { type: string }, accept: { type: boolean } } } } } }
+      responses: { "200": { description: Back to PENDING_APPROVAL }, "409": { $ref: "#/components/responses/Error" } }
+  /supervisor/orders/{id}:
+    post:
+      security: [{ staffCookie: [] }]
+      summary: Supervisor action
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/SupervisorAction" } } } }
+      responses:
+        "200": { description: OK — approve returns {status, alreadyApproved} }
+        "401": { $ref: "#/components/responses/Error" }
+        "403": { $ref: "#/components/responses/Error" }
+        "409": { description: INVALID_STATE, STALE_VERSION, CONCURRENT_UPDATE }
+  /kitchen/tickets:
+    get:
+      security: [{ staffCookie: [] }]
+      summary: KDS board (dispatched tickets only; no customer PII)
+      responses: { "200": { description: Board } }
+  /kitchen/tickets/{id}:
+    post:
+      security: [{ staffCookie: [] }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      requestBody: { required: true, content: { application/json: { schema: { type: object, required: [action], properties: { action: { enum: [start, ready, flag, clear-flag, confirm-cancel, continue] }, flag: { enum: [DELAYED, SHORTAGE, ISSUE] }, note: { type: string } } } } } }
+      responses: { "200": { description: OK }, "409": { $ref: "#/components/responses/Error" } }
+  /service/orders/{id}/serve:
+    post:
+      security: [{ staffCookie: [] }]
+      parameters: [{ name: id, in: path, required: true, schema: { type: string } }]
+      responses: { "200": { description: SERVED } }
+  /cashier/payments:
+    post:
+      security: [{ staffCookie: [] }]
+      summary: Record a manual payment (never gateway-verified)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [orderId, amountPaise, method, idempotencyKey]
+              properties:
+                orderId: { type: string }
+                amountPaise: { type: integer, minimum: 1 }
+                method: { enum: [CASH, UPI_MANUAL, CARD_AT_COUNTER, OTHER] }
+                externalReference: { type: string }
+                note: { type: string }
+                idempotencyKey: { type: string }
+      responses: { "201": { description: Recorded }, "200": { description: Duplicate }, "409": { description: NOT_BILLABLE / ALREADY_PAID }, "422": { description: OVERPAYMENT } }
+  /admin/analytics:
+    get:
+      security: [{ staffCookie: [] }]
+      parameters:
+        - { name: from, in: query, schema: { type: string, format: date } }
+        - { name: to, in: query, schema: { type: string, format: date } }
+        - { name: includeDemo, in: query, schema: { enum: ["true", "false"] } }
+      responses: { "200": { description: Metrics with definitions } }
+  /admin/analytics/export:
+    get:
+      security: [{ staffCookie: [] }]
+      parameters: [{ name: type, in: query, schema: { enum: [orders, daily, items] } }]
+      responses: { "200": { description: CSV, content: { text/csv: {} } } }

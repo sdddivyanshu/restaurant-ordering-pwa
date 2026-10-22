@@ -1,0 +1,1071 @@
+// Restaurant ordering PWA — relational schema.
+// Money is always stored as integer minor units (paise for INR). Primary keys are random
+// cuid strings, never sequential, so IDs cannot be guessed from the URL.
+
+generator client {
+  provider = "prisma-client"
+  output   = "../lib/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ───────────────────────────── Restaurant & configuration ─────────────────────────────
+
+model Restaurant {
+  id                 String              @id @default(cuid())
+  name               String
+  legalName          String?
+  address            String?
+  phone              String?
+  gstin              String?
+  currency           String              @default("INR")
+  currencySymbol     String              @default("₹")
+  defaultLanguage    String              @default("en")
+  supportedLanguages String[]            @default(["en", "hi"])
+  timezone           String              @default("Asia/Kolkata")
+  brandColor         String              @default("#b4532a")
+  isDemo             Boolean             @default(false)
+  createdAt          DateTime            @default(now())
+  updatedAt          DateTime            @updatedAt
+  settings           RestaurantSettings?
+  taxes              TaxConfiguration[]
+}
+
+enum RoundingMode {
+  NONE
+  NEAREST_RUPEE
+}
+
+enum OtpMode {
+  DISABLED
+  DEV
+  PROVIDER
+}
+
+model RestaurantSettings {
+  id                       String       @id @default(cuid())
+  restaurantId             String       @unique
+  restaurant               Restaurant   @relation(fields: [restaurantId], references: [id])
+  pricesIncludeTax         Boolean      @default(false)
+  roundingMode             RoundingMode @default(NEAREST_RUPEE)
+  phoneCountryCode         String       @default("91")
+  phoneCountryIso          String       @default("IN")
+  tableSessionHours        Int          @default(4)
+  customerSessionHours     Int          @default(4)
+  kitchenTargetMinutes     Int          @default(15)
+  approvalTargetMinutes    Int          @default(3)
+  serviceDupWindowSeconds  Int          @default(120)
+  loyaltyEnabled           Boolean      @default(true)
+  // Points are earned per this many paise of net (pre-tax, post-discount) sales.
+  loyaltyPaisePerPoint     Int          @default(1000)
+  loyaltyMinRedeemPoints   Int          @default(50)
+  // Points expire after this many days with no earning activity.
+  loyaltyExpiryDays        Int          @default(365)
+  acceptedPaymentMethods   String[]     @default(["CASH", "UPI_MANUAL", "CARD_AT_COUNTER"])
+  upiId                    String?
+  upiPayeeName             String?
+  receiptFooter            String?
+  privacyNoticeVersion     String       @default("2026-01")
+  customerDataRetentionDays Int         @default(730)
+  updatedAt                DateTime     @updatedAt
+  updatedById              String?
+}
+
+model TaxConfiguration {
+  id           String     @id @default(cuid())
+  restaurantId String
+  restaurant   Restaurant @relation(fields: [restaurantId], references: [id])
+  code         String     @unique
+  name         String
+  // Total rate in basis points (500 = 5.00%).
+  rateBps      Int
+  // Display split, e.g. [{"name":"CGST","rateBps":250},{"name":"SGST","rateBps":250}]
+  components   Json       @default("[]")
+  isDefault    Boolean    @default(false)
+  isActive     Boolean    @default(true)
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
+  items        MenuItem[]
+}
+
+// ───────────────────────────── Staff identity & RBAC ─────────────────────────────
+
+model Role {
+  id          String           @id @default(cuid())
+  key         String           @unique
+  name        String
+  description String?
+  permissions RolePermission[]
+  users       User[]
+}
+
+model Permission {
+  id          String           @id @default(cuid())
+  key         String           @unique
+  description String?
+  roles       RolePermission[]
+  userGrants  UserPermission[]
+}
+
+model RolePermission {
+  roleId       String
+  permissionId String
+  role         Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission   Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@id([roleId, permissionId])
+}
+
+// Additional per-user grants (e.g. a cashier explicitly allowed to approve orders).
+model UserPermission {
+  userId       String
+  permissionId String
+  grantedById  String?
+  createdAt    DateTime   @default(now())
+  user         User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  permission   Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@id([userId, permissionId])
+}
+
+model User {
+  id               String           @id @default(cuid())
+  email            String           @unique
+  name             String
+  passwordHash     String
+  roleId           String
+  role             Role             @relation(fields: [roleId], references: [id])
+  isActive         Boolean          @default(true)
+  isDemo           Boolean          @default(false)
+  failedLoginCount Int              @default(0)
+  lockedUntil      DateTime?
+  lastLoginAt      DateTime?
+  createdAt        DateTime         @default(now())
+  updatedAt        DateTime         @updatedAt
+  sessions         StaffSession[]
+  extraPermissions UserPermission[]
+}
+
+model StaffSession {
+  id         String    @id @default(cuid())
+  tokenHash  String    @unique
+  userId     String
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expiresAt  DateTime
+  lastSeenAt DateTime  @default(now())
+  revokedAt  DateTime?
+  userAgent  String?
+  createdAt  DateTime  @default(now())
+
+  @@index([userId])
+}
+
+// ───────────────────────────── Customers, tables & sessions ─────────────────────────────
+
+model Customer {
+  id                    String                  @id @default(cuid())
+  phoneE164             String                  @unique
+  name                  String
+  privacyConsentAt      DateTime
+  privacyConsentVersion String
+  marketingConsent      Boolean                 @default(false)
+  marketingConsentAt    DateTime?
+  verifiedAt            DateTime?
+  isDemo                Boolean                 @default(false)
+  anonymizedAt          DateTime?
+  createdAt             DateTime                @default(now())
+  updatedAt             DateTime                @updatedAt
+  sessions              CustomerSession[]
+  orders                Order[]
+  loyaltyAccount        LoyaltyAccount?
+  feedback              Feedback[]
+  notificationPref      NotificationPreference?
+}
+
+// A browser/device identity (random cookie). Used to show unverified customers only the
+// orders they placed from this device, never all orders for a typed-in phone number.
+model CustomerDevice {
+  id         String            @id @default(cuid())
+  tokenHash  String            @unique
+  createdAt  DateTime          @default(now())
+  lastSeenAt DateTime          @default(now())
+  sessions   CustomerSession[]
+  orders     Order[]
+}
+
+enum TableStatus {
+  AVAILABLE
+  OCCUPIED
+  NEEDS_CLEANING
+}
+
+model RestaurantTable {
+  id               String           @id @default(cuid())
+  label            String           @unique
+  name             String
+  seats            Int              @default(4)
+  area             String?
+  // Opaque, randomly generated token embedded in the QR URL. Null when revoked.
+  qrToken          String?          @unique
+  qrTokenRotatedAt DateTime?
+  isActive         Boolean          @default(true)
+  status           TableStatus      @default(AVAILABLE)
+  displayOrder     Int              @default(0)
+  archivedAt       DateTime?
+  createdAt        DateTime         @default(now())
+  updatedAt        DateTime         @updatedAt
+  sessions         TableSession[]
+  orders           Order[]
+  serviceRequests  ServiceRequest[]
+}
+
+enum TableSessionStatus {
+  OPEN
+  CLOSED
+}
+
+// One dining visit at a table. A partial unique index (see migration) allows only one OPEN
+// session per table, so concurrent QR scans join the same visit.
+model TableSession {
+  id               String             @id @default(cuid())
+  tableId          String
+  table            RestaurantTable    @relation(fields: [tableId], references: [id])
+  status           TableSessionStatus @default(OPEN)
+  openedAt         DateTime           @default(now())
+  expiresAt        DateTime
+  closedAt         DateTime?
+  closedById       String?
+  customerSessions CustomerSession[]
+  orders           Order[]
+  serviceRequests  ServiceRequest[]
+
+  @@index([tableId, status])
+  @@index([expiresAt])
+}
+
+model CustomerSession {
+  id             String           @id @default(cuid())
+  tokenHash      String           @unique
+  customerId     String
+  customer       Customer         @relation(fields: [customerId], references: [id])
+  tableSessionId String
+  tableSession   TableSession     @relation(fields: [tableSessionId], references: [id])
+  deviceId       String?
+  device         CustomerDevice?  @relation(fields: [deviceId], references: [id])
+  language       String           @default("en")
+  verifiedAt     DateTime?
+  otpHash        String?
+  otpExpiresAt   DateTime?
+  otpAttempts    Int              @default(0)
+  expiresAt      DateTime
+  revokedAt      DateTime?
+  createdAt      DateTime         @default(now())
+  orders         Order[]
+  serviceRequests ServiceRequest[]
+
+  @@index([customerId])
+  @@index([tableSessionId])
+}
+
+// ───────────────────────────── Menu ─────────────────────────────
+
+model MenuCategory {
+  id           String                    @id @default(cuid())
+  slug         String                    @unique
+  name         String
+  description  String?
+  parentId     String?
+  parent       MenuCategory?             @relation("CategoryTree", fields: [parentId], references: [id])
+  children     MenuCategory[]            @relation("CategoryTree")
+  displayOrder Int                       @default(0)
+  isActive     Boolean                   @default(true)
+  // Optional daily availability window, "HH:MM" in restaurant local time.
+  availableFrom String?
+  availableTo   String?
+  archivedAt   DateTime?
+  createdAt    DateTime                  @default(now())
+  updatedAt    DateTime                  @updatedAt
+  translations MenuCategoryTranslation[]
+  items        MenuItem[]
+
+  @@index([isActive, displayOrder])
+}
+
+model MenuCategoryTranslation {
+  id          String       @id @default(cuid())
+  categoryId  String
+  category    MenuCategory @relation(fields: [categoryId], references: [id], onDelete: Cascade)
+  locale      String
+  name        String
+  description String?
+
+  @@unique([categoryId, locale])
+}
+
+enum DietType {
+  VEG
+  VEGAN
+  EGG
+  NON_VEG
+}
+
+model MenuItem {
+  id                   String                       @id @default(cuid())
+  slug                 String                       @unique
+  categoryId           String
+  category             MenuCategory                 @relation(fields: [categoryId], references: [id])
+  name                 String
+  description          String?
+  imageUrl             String?
+  basePricePaise       Int
+  taxConfigId          String
+  taxConfig            TaxConfiguration             @relation(fields: [taxConfigId], references: [id])
+  dietType             DietType
+  spiceLevel           Int                          @default(0)
+  ingredients          String[]                     @default([])
+  prepMinutes          Int                          @default(15)
+  calories             Int?
+  isAvailable          Boolean                      @default(true)
+  isBestseller         Boolean                      @default(false)
+  isRecommended        Boolean                      @default(false)
+  // True only when allergen data has been checked by staff against the actual recipe.
+  allergenInfoVerified Boolean                      @default(false)
+  availableFrom        String?
+  availableTo          String?
+  seasonalFrom         DateTime?
+  seasonalTo           DateTime?
+  displayOrder         Int                          @default(0)
+  archivedAt           DateTime?
+  createdAt            DateTime                     @default(now())
+  updatedAt            DateTime                     @updatedAt
+  updatedById          String?
+  translations         MenuItemTranslation[]
+  allergens            ItemAllergen[]
+  dietaryAttributes    ItemDietaryAttribute[]
+  customizationGroups  MenuItemCustomizationGroup[]
+  orderItems           OrderItem[]
+
+  @@index([categoryId, displayOrder])
+  @@index([isAvailable])
+}
+
+model MenuItemTranslation {
+  id          String   @id @default(cuid())
+  itemId      String
+  item        MenuItem @relation(fields: [itemId], references: [id], onDelete: Cascade)
+  locale      String
+  name        String
+  description String?
+  ingredients String[] @default([])
+
+  @@unique([itemId, locale])
+}
+
+model Allergen {
+  id      String         @id @default(cuid())
+  key     String         @unique
+  name    String
+  nameI18n Json          @default("{}")
+  items   ItemAllergen[]
+}
+
+enum AllergenLevel {
+  CONTAINS
+  MAY_CONTAIN
+}
+
+model ItemAllergen {
+  itemId     String
+  allergenId String
+  level      AllergenLevel @default(CONTAINS)
+  item       MenuItem      @relation(fields: [itemId], references: [id], onDelete: Cascade)
+  allergen   Allergen      @relation(fields: [allergenId], references: [id])
+
+  @@id([itemId, allergenId])
+}
+
+model DietaryAttribute {
+  id       String                 @id @default(cuid())
+  key      String                 @unique
+  name     String
+  nameI18n Json                   @default("{}")
+  items    ItemDietaryAttribute[]
+}
+
+model ItemDietaryAttribute {
+  itemId      String
+  attributeId String
+  item        MenuItem         @relation(fields: [itemId], references: [id], onDelete: Cascade)
+  attribute   DietaryAttribute @relation(fields: [attributeId], references: [id])
+
+  @@id([itemId, attributeId])
+}
+
+enum CustomizationKind {
+  VARIANT
+  ADDON
+  CHOICE
+}
+
+model CustomizationGroup {
+  id           String                       @id @default(cuid())
+  key          String                       @unique
+  name         String
+  nameI18n     Json                         @default("{}")
+  kind         CustomizationKind            @default(ADDON)
+  isRequired   Boolean                      @default(false)
+  minSelect    Int                          @default(0)
+  maxSelect    Int                          @default(1)
+  displayOrder Int                          @default(0)
+  archivedAt   DateTime?
+  createdAt    DateTime                     @default(now())
+  updatedAt    DateTime                     @updatedAt
+  options      CustomizationOption[]
+  items        MenuItemCustomizationGroup[]
+}
+
+model CustomizationOption {
+  id              String             @id @default(cuid())
+  groupId         String
+  group           CustomizationGroup @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  name            String
+  nameI18n        Json               @default("{}")
+  priceDeltaPaise Int                @default(0)
+  isDefault       Boolean            @default(false)
+  isAvailable     Boolean            @default(true)
+  // When set, choosing this option changes the dish's diet type (e.g. "add chicken" -> NON_VEG).
+  dietType        DietType?
+  allergenKeys    String[]           @default([])
+  displayOrder    Int                @default(0)
+  archivedAt      DateTime?
+
+  @@index([groupId])
+}
+
+model MenuItemCustomizationGroup {
+  itemId       String
+  groupId      String
+  displayOrder Int                @default(0)
+  item         MenuItem           @relation(fields: [itemId], references: [id], onDelete: Cascade)
+  group        CustomizationGroup @relation(fields: [groupId], references: [id], onDelete: Cascade)
+
+  @@id([itemId, groupId])
+}
+
+// ───────────────────────────── Orders ─────────────────────────────
+
+// CART is not persisted: a cart is a client-side draft that is always re-priced by the server.
+enum OrderStatus {
+  PENDING_APPROVAL
+  CHANGE_REQUESTED
+  CUSTOMER_CONFIRMATION_REQUIRED
+  APPROVED
+  QUEUED
+  PREPARING
+  READY
+  SERVED
+  REJECTED
+  CANCELLED
+  CANCEL_REQUESTED
+}
+
+enum PaymentStatus {
+  UNPAID
+  PARTIALLY_PAID
+  PAID
+  REFUNDED
+  VOIDED
+}
+
+enum ActorType {
+  CUSTOMER
+  STAFF
+  SYSTEM
+}
+
+model Order {
+  id                  String               @id @default(cuid())
+  // Human-friendly, random (non-sequential) reference shown to customers and staff.
+  reference           String               @unique
+  customerId          String
+  customer            Customer             @relation(fields: [customerId], references: [id])
+  customerSessionId   String
+  customerSession     CustomerSession      @relation(fields: [customerSessionId], references: [id])
+  deviceId            String?
+  device              CustomerDevice?      @relation(fields: [deviceId], references: [id])
+  tableSessionId      String
+  tableSession        TableSession         @relation(fields: [tableSessionId], references: [id])
+  tableId             String
+  table               RestaurantTable      @relation(fields: [tableId], references: [id])
+  customerName        String
+  status              OrderStatus          @default(PENDING_APPROVAL)
+  paymentStatus       PaymentStatus        @default(UNPAID)
+  // Content version: increases whenever the item list changes (e.g. accepted change request).
+  version             Int                  @default(1)
+  // Optimistic-concurrency counter: increases on every state change.
+  lockVersion         Int                  @default(0)
+  subtotalPaise       Int
+  discountPaise       Int                  @default(0)
+  taxPaise            Int
+  roundingPaise       Int                  @default(0)
+  totalPaise          Int
+  taxBreakdown        Json                 @default("[]")
+  currency            String               @default("INR")
+  pricesIncludeTax    Boolean              @default(false)
+  specialInstructions String?
+  language            String               @default("en")
+  idempotencyKey      String
+  needsClarification  Boolean              @default(false)
+  clarificationNote   String?
+  submittedAt         DateTime             @default(now())
+  approvedAt          DateTime?
+  approvedById        String?
+  approvedVersion     Int?
+  queuedAt            DateTime?
+  preparingAt         DateTime?
+  readyAt             DateTime?
+  servedAt            DateTime?
+  servedById          String?
+  paidAt              DateTime?
+  rejectedAt          DateTime?
+  rejectionReason     String?
+  cancelledAt         DateTime?
+  cancelReason        String?
+  cancelledById       String?
+  isDemo              Boolean              @default(false)
+  createdAt           DateTime             @default(now())
+  updatedAt           DateTime             @updatedAt
+  items               OrderItem[]
+  history             OrderStatusHistory[]
+  approval            OrderApproval?
+  changeRequests      OrderChangeRequest[]
+  notes               OrderNote[]
+  kitchenTicket       KitchenTicket?
+  payments            Payment[]
+  adjustments         PaymentAdjustment[]
+  receipt             Receipt?
+  feedback            Feedback?
+  redemption          RewardRedemption?
+
+  @@unique([customerSessionId, idempotencyKey])
+  @@index([status, submittedAt])
+  @@index([tableSessionId])
+  @@index([customerId, createdAt])
+  @@index([paymentStatus, status])
+  @@index([createdAt])
+}
+
+// Immutable price snapshot. Rows are never edited; a change creates rows with a new `version`.
+model OrderItem {
+  id                String                   @id @default(cuid())
+  orderId           String
+  order             Order                    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  version           Int
+  menuItemId        String
+  menuItem          MenuItem                 @relation(fields: [menuItemId], references: [id])
+  nameSnapshot      String
+  nameI18nSnapshot  Json                     @default("{}")
+  dietType          DietType
+  quantity          Int
+  unitBasePaise     Int
+  unitOptionsPaise  Int
+  unitPricePaise    Int
+  lineSubtotalPaise Int
+  lineDiscountPaise Int                      @default(0)
+  lineTaxPaise      Int
+  lineTotalPaise    Int
+  taxCode           String
+  taxRateBps        Int
+  taxComponents     Json                     @default("[]")
+  prepMinutes       Int
+  allergenSnapshot  String[]                 @default([])
+  notes             String?
+  customizations    OrderItemCustomization[]
+  feedbackItems     Json?
+
+  @@index([orderId, version])
+  @@index([menuItemId])
+}
+
+model OrderItemCustomization {
+  id              String    @id @default(cuid())
+  orderItemId     String
+  orderItem       OrderItem @relation(fields: [orderItemId], references: [id], onDelete: Cascade)
+  groupId         String?
+  groupName       String
+  optionId        String?
+  optionName      String
+  priceDeltaPaise Int
+
+  @@index([optionId])
+}
+
+model OrderStatusHistory {
+  id         String       @id @default(cuid())
+  orderId    String
+  order      Order        @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  fromStatus OrderStatus?
+  toStatus   OrderStatus
+  actorType  ActorType
+  actorId    String?
+  note       String?
+  createdAt  DateTime     @default(now())
+
+  @@index([orderId, createdAt])
+  @@index([toStatus, createdAt])
+}
+
+enum ApprovalDecision {
+  APPROVED
+  REJECTED
+}
+
+// At most one final decision per order (unique orderId) — a second concurrent approval fails.
+model OrderApproval {
+  id           String           @id @default(cuid())
+  orderId      String           @unique
+  order        Order            @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  decision     ApprovalDecision
+  orderVersion Int
+  actorId      String
+  reason       String?
+  createdAt    DateTime         @default(now())
+}
+
+enum ChangeRequestKind {
+  SUBSTITUTION
+  QUANTITY
+  CUSTOMIZATION
+  REMOVAL
+  MIXED
+}
+
+enum ChangeRequestStatus {
+  PROPOSED
+  ACCEPTED
+  DECLINED
+  SUPERSEDED
+}
+
+model OrderChangeRequest {
+  id             String              @id @default(cuid())
+  orderId        String
+  order          Order               @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  fromVersion    Int
+  kind           ChangeRequestKind
+  reason         String
+  // Proposed cart lines and the server-computed quote for them.
+  proposedLines  Json
+  proposedQuote  Json
+  status         ChangeRequestStatus @default(PROPOSED)
+  createdById    String
+  createdAt      DateTime            @default(now())
+  respondedAt    DateTime?
+
+  @@index([orderId, status])
+}
+
+model OrderNote {
+  id        String   @id @default(cuid())
+  orderId   String
+  order     Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  authorId  String
+  body      String
+  createdAt DateTime @default(now())
+
+  @@index([orderId])
+}
+
+// ───────────────────────────── Kitchen ─────────────────────────────
+
+enum KitchenStatus {
+  QUEUED
+  PREPARING
+  READY
+  COMPLETED
+  CANCEL_REQUESTED
+  CANCELLED
+}
+
+enum KitchenFlag {
+  NONE
+  DELAYED
+  SHORTAGE
+  ISSUE
+}
+
+// One ticket per order (unique orderId) — duplicate dispatches cannot create a second ticket.
+model KitchenTicket {
+  id            String              @id @default(cuid())
+  orderId       String              @unique
+  order         Order               @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  orderVersion  Int
+  orderRef      String
+  tableLabel    String
+  status        KitchenStatus       @default(QUEUED)
+  priority      Int                 @default(0)
+  targetMinutes Int
+  flag          KitchenFlag         @default(NONE)
+  flagNote      String?
+  flaggedAt     DateTime?
+  flagResolved  Boolean             @default(false)
+  notes         String?
+  startedAt     DateTime?
+  readyAt       DateTime?
+  completedAt   DateTime?
+  lockVersion   Int                 @default(0)
+  createdAt     DateTime            @default(now())
+  updatedAt     DateTime            @updatedAt
+  items         KitchenTicketItem[]
+
+  @@index([status, createdAt])
+}
+
+model KitchenTicketItem {
+  id          String        @id @default(cuid())
+  ticketId    String
+  ticket      KitchenTicket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  orderItemId String
+  name        String
+  quantity    Int
+  modifiers   String[]      @default([])
+  notes       String?
+  allergens   String[]      @default([])
+  dietType    DietType
+  prepMinutes Int           @default(10)
+
+  @@index([ticketId])
+}
+
+// ───────────────────────────── Billing ─────────────────────────────
+
+enum PaymentMethod {
+  CASH
+  UPI_MANUAL
+  CARD_AT_COUNTER
+  OTHER
+}
+
+enum PaymentRecordStatus {
+  RECORDED
+  VOIDED
+}
+
+model Payment {
+  id                 String              @id @default(cuid())
+  orderId            String
+  order              Order               @relation(fields: [orderId], references: [id])
+  amountPaise        Int
+  method             PaymentMethod
+  status             PaymentRecordStatus @default(RECORDED)
+  // Always false in the MVP: payments are recorded manually, not verified by a gateway.
+  providerVerified   Boolean             @default(false)
+  provider           String              @default("manual")
+  externalReference  String?
+  idempotencyKey     String
+  note               String?
+  recordedById       String
+  voidedAt           DateTime?
+  voidedById         String?
+  voidReason         String?
+  createdAt          DateTime            @default(now())
+
+  @@unique([orderId, idempotencyKey])
+  @@index([createdAt])
+}
+
+enum AdjustmentType {
+  DISCOUNT
+  CORRECTION
+  REFUND
+  PAYMENT_VOID
+}
+
+model PaymentAdjustment {
+  id          String         @id @default(cuid())
+  orderId     String
+  order       Order          @relation(fields: [orderId], references: [id])
+  type        AdjustmentType
+  // Positive amounts reduce what the customer owes (discount/correction) or record money returned (refund).
+  amountPaise Int
+  reason      String
+  paymentId   String?
+  actorId     String
+  createdAt   DateTime       @default(now())
+
+  @@index([orderId])
+}
+
+model Receipt {
+  id         String   @id @default(cuid())
+  orderId    String   @unique
+  order      Order    @relation(fields: [orderId], references: [id])
+  number     String   @unique
+  snapshot   Json
+  issuedAt   DateTime @default(now())
+  issuedById String?
+}
+
+// ───────────────────────────── Reliability & audit ─────────────────────────────
+
+enum OutboxStatus {
+  PENDING
+  PROCESSING
+  DONE
+  FAILED
+}
+
+model OutboxEvent {
+  id            String       @id @default(cuid())
+  type          String
+  aggregateId   String
+  // Unique key — enqueuing the same logical event twice is a no-op.
+  dedupeKey     String       @unique
+  payload       Json
+  status        OutboxStatus @default(PENDING)
+  attempts      Int          @default(0)
+  maxAttempts   Int          @default(8)
+  nextAttemptAt DateTime     @default(now())
+  lockedAt      DateTime?
+  lastError     String?
+  processedAt   DateTime?
+  createdAt     DateTime     @default(now())
+
+  @@index([status, nextAttemptAt])
+  @@index([aggregateId])
+}
+
+model AuditLog {
+  id         String    @id @default(cuid())
+  actorType  ActorType
+  actorId    String?
+  actorLabel String?
+  action     String
+  entityType String
+  entityId   String
+  before     Json?
+  after      Json?
+  meta       Json?
+  createdAt  DateTime  @default(now())
+
+  @@index([entityType, entityId])
+  @@index([action, createdAt])
+  @@index([createdAt])
+}
+
+// ───────────────────────────── Engagement ─────────────────────────────
+
+model LoyaltyAccount {
+  id               String               @id @default(cuid())
+  customerId       String               @unique
+  customer         Customer             @relation(fields: [customerId], references: [id])
+  balance          Int                  @default(0)
+  lifetimeEarned   Int                  @default(0)
+  lifetimeRedeemed Int                  @default(0)
+  lastEarnedAt     DateTime?
+  createdAt        DateTime             @default(now())
+  updatedAt        DateTime             @updatedAt
+  entries          LoyaltyLedgerEntry[]
+  redemptions      RewardRedemption[]
+}
+
+enum LoyaltyEntryType {
+  EARN
+  EARN_REVERSAL
+  REDEEM
+  REDEEM_REVERSAL
+  ADJUST
+  EXPIRE
+}
+
+model LoyaltyLedgerEntry {
+  id           String           @id @default(cuid())
+  accountId    String
+  account      LoyaltyAccount   @relation(fields: [accountId], references: [id])
+  type         LoyaltyEntryType
+  points       Int
+  balanceAfter Int
+  orderId      String?
+  redemptionId String?
+  reason       String?
+  actorId      String?
+  // e.g. "earn:<orderId>" — unique, so points for one order can never be awarded twice.
+  dedupeKey    String?          @unique
+  createdAt    DateTime         @default(now())
+
+  @@index([accountId, createdAt])
+  @@index([orderId])
+}
+
+enum RewardType {
+  PERCENT_OFF
+  FIXED_OFF
+  FREE_ITEM
+}
+
+model Reward {
+  id              String             @id @default(cuid())
+  name            String
+  nameI18n        Json               @default("{}")
+  description     String?
+  descriptionI18n Json               @default("{}")
+  type            RewardType
+  pointsCost      Int
+  valuePaise      Int?
+  percentBps      Int?
+  maxDiscountPaise Int?
+  freeMenuItemId  String?
+  minOrderPaise   Int                @default(0)
+  isActive        Boolean            @default(true)
+  validFrom       DateTime?
+  validTo         DateTime?
+  displayOrder    Int                @default(0)
+  createdAt       DateTime           @default(now())
+  updatedAt       DateTime           @updatedAt
+  redemptions     RewardRedemption[]
+}
+
+enum RedemptionStatus {
+  APPLIED
+  REVERSED
+}
+
+model RewardRedemption {
+  id            String           @id @default(cuid())
+  rewardId      String
+  reward        Reward           @relation(fields: [rewardId], references: [id])
+  accountId     String
+  account       LoyaltyAccount   @relation(fields: [accountId], references: [id])
+  orderId       String           @unique
+  order         Order            @relation(fields: [orderId], references: [id])
+  pointsSpent   Int
+  discountPaise Int
+  status        RedemptionStatus @default(APPLIED)
+  createdAt     DateTime         @default(now())
+  reversedAt    DateTime?
+}
+
+enum ServiceRequestType {
+  WAITER
+  WATER
+  CUTLERY
+  BILL
+  TAKEAWAY_PACKAGING
+  ASSISTANCE
+  CUSTOM
+}
+
+enum ServiceRequestStatus {
+  PENDING
+  ACKNOWLEDGED
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+}
+
+enum Priority {
+  LOW
+  NORMAL
+  HIGH
+}
+
+model ServiceRequest {
+  id                String               @id @default(cuid())
+  tableId           String
+  table             RestaurantTable      @relation(fields: [tableId], references: [id])
+  tableSessionId    String
+  tableSession      TableSession         @relation(fields: [tableSessionId], references: [id])
+  customerSessionId String?
+  customerSession   CustomerSession?     @relation(fields: [customerSessionId], references: [id])
+  type              ServiceRequestType
+  message           String?
+  priority          Priority             @default(NORMAL)
+  status            ServiceRequestStatus @default(PENDING)
+  assignedToId      String?
+  acknowledgedAt    DateTime?
+  completedAt       DateTime?
+  cancelledAt       DateTime?
+  isDemo            Boolean              @default(false)
+  createdAt         DateTime             @default(now())
+  updatedAt         DateTime             @updatedAt
+
+  @@index([status, createdAt])
+  @@index([tableSessionId, type, createdAt])
+}
+
+enum FeedbackStatus {
+  NEW
+  RESOLVED
+}
+
+model Feedback {
+  id             String             @id @default(cuid())
+  orderId        String             @unique
+  order          Order              @relation(fields: [orderId], references: [id])
+  customerId     String
+  customer       Customer           @relation(fields: [customerId], references: [id])
+  overall        Int
+  food           Int
+  service        Int
+  comment        String?
+  itemRatings    Json               @default("[]")
+  isComplaint    Boolean            @default(false)
+  status         FeedbackStatus     @default(NEW)
+  resolvedById   String?
+  resolvedAt     DateTime?
+  isDemo         Boolean            @default(false)
+  createdAt      DateTime           @default(now())
+  responses      FeedbackResponse[]
+
+  @@index([createdAt])
+  @@index([status, isComplaint])
+}
+
+model FeedbackResponse {
+  id         String   @id @default(cuid())
+  feedbackId String
+  feedback   Feedback @relation(fields: [feedbackId], references: [id], onDelete: Cascade)
+  authorId   String
+  body       String
+  createdAt  DateTime @default(now())
+}
+
+model NotificationPreference {
+  id               String   @id @default(cuid())
+  customerId       String   @unique
+  customer         Customer @relation(fields: [customerId], references: [id])
+  // Service messages (order status) are always delivered in-app; marketing is opt-in only.
+  marketingSms     Boolean  @default(false)
+  marketingWhatsApp Boolean @default(false)
+  updatedAt        DateTime @updatedAt
+}
+
+enum NotificationChannel {
+  IN_APP
+  SMS
+}
+
+enum NotificationStatus {
+  QUEUED
+  SENT
+  SKIPPED
+  FAILED
+}
+
+// Delivery log of customer-facing notifications (status changes, change requests, ...).
+model NotificationEvent {
+  id         String              @id @default(cuid())
+  customerId String?
+  orderId    String?
+  channel    NotificationChannel @default(IN_APP)
+  template   String
+  status     NotificationStatus  @default(SENT)
+  payload    Json                @default("{}")
+  createdAt  DateTime            @default(now())
+
+  @@index([orderId])
+}
+
+// Simple key/value store used by rate limiting across instances is NOT included; see docs.

@@ -1,0 +1,26 @@
+# Render Blueprint — free web service. Database: Neon (free Postgres), connection string entered in
+# the Render dashboard when the Blueprint is created (never committed).
+services:
+  - type: web
+    name: restaurant-ordering-pwa
+    runtime: node
+    plan: free
+    region: singapore
+    buildCommand: npm ci && npm run build
+    startCommand: npm start
+    healthCheckPath: /api/v1/health
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      - key: DATABASE_URL
+        sync: false # paste Neon's pooled connection string
+      - key: APP_BASE_URL
+        sync: false # https://<service-name>.onrender.com (used inside QR codes and for the CSRF origin check)
+      - key: APP_SECRET
+        generateValue: true
+      - key: TRUST_PROXY
+        value: "true"
+      - key: OTP_MODE
+        value: disabled # no SMS provider yet; dev codes are never shown in production
+      - key: NEXT_TELEMETRY_DISABLED
+        value: "1"

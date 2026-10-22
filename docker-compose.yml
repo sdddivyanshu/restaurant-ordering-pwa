@@ -1,0 +1,23 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: restaurant-pwa-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: restaurant
+      POSTGRES_PASSWORD: restaurant_dev_password
+      POSTGRES_DB: restaurant
+    ports:
+      # 5433 on the host avoids clashing with a locally installed PostgreSQL on 5432.
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./docker/postgres-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U restaurant -d restaurant"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  pgdata:
